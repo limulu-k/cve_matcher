@@ -1,0 +1,13 @@
+# data folder
+data/
+nvd-json-2.0/
+
+# result files
+workspace/
+workspace_refonly_nvd_cache/
+
+# tmp files <- past code&anaysis files
+tmp/
+
+# personal files
+VEX_2025_연구노트/
