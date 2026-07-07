@@ -1,0 +1,24 @@
+{
+  "match_rows": 20947,
+  "review_inserted_rows": 185,
+  "review_actions": {
+    "keep_review": 15,
+    "accept": 169,
+    "reject": 1
+  },
+  "mismatch_or_review_rows": 75,
+  "strong_mismatch_reject_rows": 1,
+  "substring_false_positive_term_rows": 5,
+  "redirect_pair_rows": 785,
+  "redirect_repo_count": 218,
+  "outputs": {
+    "review_inserted_manual_decision": "review_inserted_manual_decision.csv",
+    "mismatch_or_review_cve_github_pairs": "mismatch_or_review_cve_github_pairs.csv",
+    "strong_mismatch_reject_pairs": "strong_mismatch_reject_pairs.csv",
+    "substring_false_positive_nonproduct_term_cases": "substring_false_positive_nonproduct_term_cases.csv",
+    "metadata_nonproduct_term_boundary_audit": "metadata_nonproduct_term_boundary_audit.csv",
+    "github_redirect_cve_github_match_pairs": "github_redirect_cve_github_match_pairs.csv",
+    "root_404_reference_evidence_accept_policy": "root_404_reference_evidence_accept_policy.csv"
+  },
+  "root_404_policy_accept_rows": 183
+}

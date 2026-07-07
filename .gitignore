@@ -2,10 +2,16 @@
 data/
 nvd-json-2.0/
 
+# log
+logs/
+
+# llm's workspace
+codex_res
+
 # result files
 workspace/
 workspace_refonly_nvd_cache/
-workspace_refiltered_nvd2db/
+workspace_*/
 
 # tmp files <- past code&anaysis files
 tmp/

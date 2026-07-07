@@ -89,6 +89,46 @@ HARD_NON_PRODUCT_TOKENS = {
     "oss-fuzz", "cvelist",
 }
 
+# token 길이 mismatch를 완화하기 위한 qualifier token.
+# 이 token들은 product identity 자체라기보다 구현 언어/패키징/플랫폼/형태를 나타내는 경우가 많다.
+# 예: php-src -> php, behaviortree.cpp -> behaviortree, jmespath.php -> jmespath
+LANGUAGE_QUALIFIER_TOKENS = {
+    "php", "js", "javascript", "ts", "typescript", "py", "python", "rb", "ruby",
+    "java", "go", "golang", "rs", "rust", "cpp", "c", "cc", "cxx",
+    "net", "dotnet", "cs", "csharp", "node", "nodejs", "npm", "composer",
+}
+
+PRODUCT_QUALIFIER_TOKENS = {
+    "src", "source", "lib", "library", "sdk", "api", "cli", "app", "apps",
+    "server", "client", "cms", "web", "ui", "mcp", "plugin", "plugins",
+    "extension", "extensions", "driver", "connector", "provider", "operator",
+    "framework", "toolkit", "bundle", "package", "packages", "module", "modules",
+    "agent", "daemon", "service", "core",
+}
+
+PLATFORM_QUALIFIER_TOKENS = {
+    "chrome", "chromium", "firefox", "vscode", "visualstudio", "wordpress", "wp",
+    "electron", "android", "ios", "macos", "windows", "linux", "kubernetes", "k8s",
+}
+
+OWNER_SUFFIX_QUALIFIER_TOKENS = {
+    "js", "io", "org", "hq", "app", "dev", "project", "projects", "team", "labs",
+}
+
+QUALIFIER_TOKENS = (
+    LANGUAGE_QUALIFIER_TOKENS
+    | PRODUCT_QUALIFIER_TOKENS
+    | PLATFORM_QUALIFIER_TOKENS
+    | OWNER_SUFFIX_QUALIFIER_TOKENS
+)
+
+QUALIFIER_REMOVAL_PENALTY = 0.04
+
+GENERIC_ONLY_AUTO_ACCEPT_RISK_TOKENS = GENERIC_LOW_WEIGHT_TOKENS | {
+    "core", "server", "client", "framework", "common", "commons", "service",
+    "system", "tool", "tools", "utils", "utility", "api", "web", "ui",
+}
+
 WILDCARD_VERSIONS = {
     "", "*", "-", "n/a", "na", "any", "all", "unspecified", "null", "none"
 }
@@ -189,6 +229,8 @@ class AxisScore:
     token_set_equal: bool
     token_len_equal: bool
     generic_removed: int
+    qualifier_removed: int
+    qualifier_tokens_removed: str
     branch: str
     left_tokens: str
     right_tokens: str
@@ -221,12 +263,18 @@ class CandidateScore:
     repo_cosine: float
     owner_generic_removed: int
     repo_generic_removed: int
+    owner_qualifier_removed: int
+    repo_qualifier_removed: int
+    owner_qualifier_tokens_removed: str
+    repo_qualifier_tokens_removed: str
     owner_penalty: float
     repo_penalty: float
     soft_tokens: str
     hard_tokens: str
     generic_tokens: str
+    qualifier_tokens: str
     decision: str
+    decision_rule: str
     reject_reason: str
 
 
@@ -458,11 +506,16 @@ def normalize_for_match(s: Any) -> str:
     return s
 
 
-def make_key(s: Any, drop_generic: bool = False) -> Key:
+def make_key(s: Any, drop_generic: bool = False, drop_tokens: Optional[Set[str]] = None) -> Key:
     norm = normalize_for_match(s)
     tokens = tuple(re.findall(r"[a-z0-9]+", norm))
+    remove_tokens: Set[str] = set()
     if drop_generic:
-        tokens = tuple(t for t in tokens if t not in GENERIC_LOW_WEIGHT_TOKENS)
+        remove_tokens |= GENERIC_LOW_WEIGHT_TOKENS
+    if drop_tokens:
+        remove_tokens |= set(drop_tokens)
+    if remove_tokens:
+        tokens = tuple(t for t in tokens if t not in remove_tokens)
 
     seen: Set[str] = set()
     unique_ordered: List[str] = []
@@ -618,6 +671,8 @@ def score_equal_or_raw(left: Key, right: Key, alpha: float, ngram: int, compact_
         token_set_equal=token_set_equal,
         token_len_equal=token_len_equal,
         generic_removed=0,
+        qualifier_removed=0,
+        qualifier_tokens_removed="",
         branch=branch,
         left_tokens=" ".join(left.tokens_unique),
         right_tokens=" ".join(right.tokens_unique),
@@ -630,37 +685,93 @@ def count_removed_generic(original: Key, filtered: Key) -> int:
     return max(0, len(original.tokens_unique) - len(filtered.tokens_unique))
 
 
+def removed_tokens_between(original: Key, filtered: Key) -> Set[str]:
+    return set(original.tokens_unique) - set(filtered.tokens_unique)
+
+
+def extra_qualifier_drop_sets(left: Key, right: Key) -> Tuple[Set[str], Set[str]]:
+    """
+    token 길이가 다른 경우 shared identity token은 보존하고, 한쪽에만 붙은 qualifier token만 제거한다.
+    예:
+      php vs php-src             -> right에서 src 제거
+      behaviortree vs cpp suffix -> right에서 cpp 제거
+      wp-auth0 vs auth0-php      -> left에서 wp, right에서 php 제거
+      chrome vs chrome-php       -> right에서 php 제거, shared chrome은 보존
+    """
+    left_set = set(left.tokens_unique)
+    right_set = set(right.tokens_unique)
+    shared = left_set & right_set
+    left_drop = {t for t in left_set - shared if t in QUALIFIER_TOKENS}
+    right_drop = {t for t in right_set - shared if t in QUALIFIER_TOKENS}
+    return left_drop, right_drop
+
+
 def score_axis(left_raw: Any, right_raw: Any, alpha: float, ngram: int, compact_mode: str) -> AxisScore:
     """
     left_raw/right_raw 한 축의 score를 계산한다.
-    - token 길이가 같으면 바로 token/char score 계산
+    - token 길이가 같으면 token/char score 계산
     - token 길이가 다르면 generic low-weight token 제거 후 재비교
-    - 제거 후 같아지면 generic penalty만 차감
-    - 제거 후에도 다르면 raw char score를 사용하되 cap은 적용하지 않는다.
+    - generic 제거 후에도 다르면 qualifier token 제거 후 재비교
+    - qualifier 제거 후 같아지면 낮은 penalty만 차감하고 후보를 살린다.
+    - 그래도 다르면 raw char score를 사용하되 cap은 적용하지 않는다.
     """
     left = make_key(left_raw)
     right = make_key(right_raw)
 
     if len(left.tokens_unique) == len(right.tokens_unique):
         out = score_equal_or_raw(left, right, alpha, ngram, compact_mode)
+        # 길이는 같지만 한쪽에는 wp, 다른 한쪽에는 php처럼 qualifier가 엇갈려 붙은 경우를 복구한다.
+        if not out.token_set_equal:
+            left_drop, right_drop = extra_qualifier_drop_sets(left, right)
+            if left_drop or right_drop:
+                left_q = make_key(left_raw, drop_tokens=left_drop)
+                right_q = make_key(right_raw, drop_tokens=right_drop)
+                qualifier_removed = count_removed_generic(left, left_q) + count_removed_generic(right, right_q)
+                qualifier_removed_tokens = sorted(removed_tokens_between(left, left_q) | removed_tokens_between(right, right_q))
+                if len(left_q.tokens_unique) == len(right_q.tokens_unique) and len(left_q.tokens_unique) > 0:
+                    qout = score_equal_or_raw(left_q, right_q, alpha, ngram, compact_mode)
+                    qout.qualifier_removed = qualifier_removed
+                    qout.qualifier_tokens_removed = " ".join(qualifier_removed_tokens)
+                    qout.score = clamp01(qout.score - QUALIFIER_REMOVAL_PENALTY * qualifier_removed)
+                    qout.branch = "qualifier_removed_equal_len:" + qout.branch
+                    if qout.score > out.score:
+                        return qout
         out.branch = "equal_len:" + out.branch
         return out
 
+    # 1) generic low-weight token 제거 branch
     left_g = make_key(left_raw, drop_generic=True)
     right_g = make_key(right_raw, drop_generic=True)
-    removed = count_removed_generic(left, left_g) + count_removed_generic(right, right_g)
+    generic_removed = count_removed_generic(left, left_g) + count_removed_generic(right, right_g)
 
     if len(left_g.tokens_unique) == len(right_g.tokens_unique) and len(left_g.tokens_unique) > 0:
         out = score_equal_or_raw(left_g, right_g, alpha, ngram, compact_mode)
-        out.generic_removed = removed
-        out.score = clamp01(out.score - 0.03 * removed)
+        out.generic_removed = generic_removed
+        out.score = clamp01(out.score - 0.03 * generic_removed)
         out.branch = "generic_removed_equal_len:" + out.branch
         return out
 
+    # 2) qualifier token 제거 branch. shared token은 보존하고 한쪽에만 붙은 qualifier만 제거한다.
+    left_drop, right_drop = extra_qualifier_drop_sets(left_g, right_g)
+    if left_drop or right_drop:
+        left_q = make_key(left_raw, drop_generic=True, drop_tokens=left_drop)
+        right_q = make_key(right_raw, drop_generic=True, drop_tokens=right_drop)
+        qualifier_removed = count_removed_generic(left_g, left_q) + count_removed_generic(right_g, right_q)
+        qualifier_removed_tokens = sorted(removed_tokens_between(left_g, left_q) | removed_tokens_between(right_g, right_q))
+        if len(left_q.tokens_unique) == len(right_q.tokens_unique) and len(left_q.tokens_unique) > 0:
+            out = score_equal_or_raw(left_q, right_q, alpha, ngram, compact_mode)
+            out.generic_removed = generic_removed
+            out.qualifier_removed = qualifier_removed
+            out.qualifier_tokens_removed = " ".join(qualifier_removed_tokens)
+            out.score = clamp01(out.score - 0.03 * generic_removed - QUALIFIER_REMOVAL_PENALTY * qualifier_removed)
+            out.branch = "qualifier_removed_equal_len:" + out.branch
+            return out
+
+    # 3) 그래도 불일치하면 compact key char score 사용. cap은 적용하지 않는다.
     out = score_equal_or_raw(left, right, alpha, ngram, compact_mode)
-    out.generic_removed = removed
-    if removed:
-        out.score = clamp01(out.score - 0.03 * removed)
+    out.generic_removed = generic_removed
+    if generic_removed:
+        out.score = clamp01(out.score - 0.03 * generic_removed)
     out.branch = "unequal_len:" + out.branch
     return out
 
@@ -678,6 +789,20 @@ def token_class_counts(tokens: Sequence[str]) -> Tuple[Set[str], Set[str], Set[s
     soft = toks & SOFT_NON_PRODUCT_TOKENS
     hard = toks & HARD_NON_PRODUCT_TOKENS
     return generic, soft, hard
+
+
+def qualifier_token_hits(tokens: Sequence[str]) -> Set[str]:
+    return set(tokens) & QUALIFIER_TOKENS
+
+
+def is_generic_only_risky_product_or_repo(product_tokens: Sequence[str], repo_tokens: Sequence[str]) -> bool:
+    product = tuple(product_tokens)
+    repo = tuple(repo_tokens)
+    if len(product) == 1 and product[0] in GENERIC_ONLY_AUTO_ACCEPT_RISK_TOKENS:
+        return True
+    if len(repo) == 1 and repo[0] in GENERIC_ONLY_AUTO_ACCEPT_RISK_TOKENS:
+        return True
+    return False
 
 
 def non_product_penalty(tokens: Sequence[str]) -> float:
@@ -703,6 +828,12 @@ def score_candidate(
     ngram: int,
     compact_mode: str,
     reject_soft_hard: bool = True,
+    borderline_threshold: float = 0.88,
+    repo_exact_accept_threshold: float = 0.98,
+    qualifier_score_threshold: float = 0.90,
+    qualifier_owner_accept_threshold: float = 0.90,
+    soft_review_threshold: float = 0.90,
+    repo_borderline_min: float = 0.84,
 ) -> CandidateScore:
     vendor = cpe_row.get("vendor") or ""
     product = cpe_row.get("product") or ""
@@ -714,7 +845,6 @@ def score_candidate(
 
     owner_key = make_key(owner)
     repo_key_obj = make_key(repo)
-    vendor_key = make_key(vendor)
     product_key = make_key(product)
 
     owner_pen = non_product_penalty(owner_key.tokens_unique)
@@ -726,16 +856,68 @@ def score_candidate(
 
     all_tokens = tokens_anywhere(owner_key.tokens_unique, repo_key_obj.tokens_unique)
     generic, soft, hard = token_class_counts(tuple(all_tokens))
+    qualifier = qualifier_token_hits(tuple(all_tokens))
 
-    if reject_soft_hard and (soft or hard):
+    source_is_ref = gh.source == "ref"
+    has_qualifier_removed_match = repo_axis.branch.startswith("qualifier_removed_equal_len:")
+    clean_nonproduct = not soft and not hard
+    generic_only_risk = is_generic_only_risky_product_or_repo(product_key.tokens_unique, repo_key_obj.tokens_unique)
+
+    decision = "reject"
+    decision_rule = "below_threshold"
+    reject_reason = "below_threshold"
+
+    if reject_soft_hard and hard:
         decision = "reject"
-        reject_reason = "soft_or_hard_non_product_token"
+        decision_rule = "hard_non_product_token"
+        reject_reason = "hard_non_product_token"
+    elif reject_soft_hard and soft:
+        if fitness >= soft_review_threshold and not hard:
+            decision = "review"
+            decision_rule = "soft_only_high_score_review"
+            reject_reason = "review_soft_non_product_token"
+        else:
+            decision = "reject"
+            decision_rule = "soft_non_product_token"
+            reject_reason = "soft_non_product_token"
     elif fitness >= threshold:
         decision = "accept"
+        decision_rule = "score_threshold"
         reject_reason = ""
+    elif source_is_ref and clean_nonproduct and repo_score >= repo_exact_accept_threshold:
+        # Direct ref이고 repo/product가 거의 확정적으로 일치하는 경우 owner mismatch를 완화한다.
+        # 예: go-gorm@gorm, mysqljs@mysql, php@php-src의 repo exact/near exact 계열
+        decision = "accept"
+        decision_rule = "ref_clean_repo_score_ge_threshold"
+        reject_reason = ""
+    elif source_is_ref and clean_nonproduct and has_qualifier_removed_match and repo_score >= qualifier_score_threshold:
+        # product-repo가 qualifier 제거 후 일치하는 경우. owner도 강하면 accept, 아니면 review.
+        # 예: php-src, jmespath.php, behaviortree.cpp, chrome-php 계열
+        if owner_score >= qualifier_owner_accept_threshold:
+            decision = "accept"
+            decision_rule = "qualifier_removed_owner_strong_accept"
+            reject_reason = ""
+        else:
+            decision = "review"
+            decision_rule = "qualifier_removed_owner_weak_review"
+            reject_reason = "review_qualifier_removed_owner_weak"
+    elif source_is_ref and clean_nonproduct and fitness >= borderline_threshold and repo_score >= repo_borderline_min:
+        decision = "review"
+        decision_rule = "borderline_ref_clean_review"
+        reject_reason = "review_borderline"
+    elif source_is_ref and clean_nonproduct and owner_score >= 0.95 and repo_score >= repo_borderline_min:
+        decision = "review"
+        decision_rule = "owner_exact_repo_high_review"
+        reject_reason = "review_owner_exact_repo_high"
     else:
         decision = "reject"
+        decision_rule = "below_threshold"
         reject_reason = "below_threshold"
+
+    if decision == "accept" and generic_only_risk and owner_score < 0.90:
+        decision = "review"
+        decision_rule = "generic_only_owner_weak_review"
+        reject_reason = "review_generic_only_owner_weak"
 
     range_key = "|".join([
         str(cpe_row.get("cpe_uri") or ""),
@@ -769,12 +951,18 @@ def score_candidate(
         repo_cosine=repo_axis.cosine,
         owner_generic_removed=owner_axis.generic_removed,
         repo_generic_removed=repo_axis.generic_removed,
+        owner_qualifier_removed=owner_axis.qualifier_removed,
+        repo_qualifier_removed=repo_axis.qualifier_removed,
+        owner_qualifier_tokens_removed=owner_axis.qualifier_tokens_removed,
+        repo_qualifier_tokens_removed=repo_axis.qualifier_tokens_removed,
         owner_penalty=owner_pen,
         repo_penalty=repo_pen,
         soft_tokens=" ".join(sorted(soft)),
         hard_tokens=" ".join(sorted(hard)),
         generic_tokens=" ".join(sorted(generic)),
+        qualifier_tokens=" ".join(sorted(qualifier)),
         decision=decision,
+        decision_rule=decision_rule,
         reject_reason=reject_reason,
     )
 
@@ -1605,6 +1793,7 @@ def build_from_nvd(conn: sqlite3.Connection, nvd_input: Path, args: argparse.Nam
     """
 
     accepted_audit: List[Dict[str, Any]] = []
+    review_audit: List[Dict[str, Any]] = []
     rejected_audit: List[Dict[str, Any]] = []
     seen_ranges_global: Set[Tuple[Any, ...]] = set()
 
@@ -1663,10 +1852,32 @@ def build_from_nvd(conn: sqlite3.Connection, nvd_input: Path, args: argparse.Nam
                     ngram=args.ngram,
                     compact_mode=args.compact_mode,
                     reject_soft_hard=not args.allow_soft_hard,
+                    borderline_threshold=args.borderline_threshold,
+                    repo_exact_accept_threshold=args.repo_exact_accept_threshold,
+                    qualifier_score_threshold=args.qualifier_score_threshold,
+                    qualifier_owner_accept_threshold=args.qualifier_owner_accept_threshold,
+                    soft_review_threshold=args.soft_review_threshold,
+                    repo_borderline_min=args.repo_borderline_min,
                 )
 
-                if cs.decision == "accept":
-                    stats["candidate_accept"] += 1
+                stats[f"candidate_decision:{cs.decision}"] += 1
+                stats[f"candidate_rule:{cs.decision_rule}"] += 1
+                stats[f"candidate_owner_branch:{cs.owner_branch}"] += 1
+                stats[f"candidate_repo_branch:{cs.repo_branch}"] += 1
+                if cs.qualifier_tokens:
+                    stats["candidate_has_qualifier_token"] += 1
+                if cs.repo_qualifier_removed:
+                    stats["candidate_repo_qualifier_removed"] += 1
+                if cs.owner_qualifier_removed:
+                    stats["candidate_owner_qualifier_removed"] += 1
+
+                insertable = cs.decision == "accept" or (args.insert_review and cs.decision == "review")
+
+                if insertable:
+                    if cs.decision == "accept":
+                        stats["candidate_accept"] += 1
+                    else:
+                        stats["candidate_review_inserted"] += 1
                     key = (cve_id, cs.repo_key, cs.github_url)
                     old = best_by_ref.get(key)
                     if old is None or cs.fitness_score > old[0].fitness_score:
@@ -1682,6 +1893,10 @@ def build_from_nvd(conn: sqlite3.Connection, nvd_input: Path, args: argparse.Nam
                     ))
                     if args.write_audit:
                         accepted_audit.append(asdict(cs))
+                elif cs.decision == "review":
+                    stats["candidate_review"] += 1
+                    if args.write_audit and len(review_audit) < args.max_review_audit_rows:
+                        review_audit.append(asdict(cs))
                 else:
                     stats[f"candidate_reject:{cs.reject_reason}"] += 1
                     if cs.soft_tokens:
@@ -1763,6 +1978,7 @@ def build_from_nvd(conn: sqlite3.Connection, nvd_input: Path, args: argparse.Nam
 
     if args.write_audit:
         write_candidate_audit_csv(out_dir / "accepted_candidate_pairs.csv", accepted_audit)
+        write_candidate_audit_csv(out_dir / "review_candidate_pairs.csv", review_audit)
         write_candidate_audit_csv(out_dir / "rejected_candidate_pairs_sample.csv", rejected_audit)
 
     return stats
@@ -1862,7 +2078,10 @@ def load_github_cache(conn: sqlite3.Connection, cache_dir: Path) -> Counter:
 
 def range_repo_score_ok(rng: Dict[str, Any], repo_key_str: str, args: argparse.Namespace) -> bool:
     owner, repo = split_repo_key(repo_key_str)
-    gh = GitHubRepoCandidate(owner=owner, repo=repo, url=f"https://github.com/{owner}/{repo}", source="index_filter")
+    # nvd_cpe_ranges에는 이미 선택된 mapping의 CPE evidence만 들어간다.
+    # version index 재검사는 안전장치이므로, source-sensitive ref recovery rule이 사라져
+    # php-src / chromedevtools 같은 회복 후보가 다시 잘리지 않도록 source를 ref로 둔다.
+    gh = GitHubRepoCandidate(owner=owner, repo=repo, url=f"https://github.com/{owner}/{repo}", source="ref")
     cs = score_candidate(
         cve_id=str(rng.get("cve_id") or ""),
         cpe_row=rng,
@@ -1874,8 +2093,14 @@ def range_repo_score_ok(rng: Dict[str, Any], repo_key_str: str, args: argparse.N
         ngram=args.ngram,
         compact_mode=args.compact_mode,
         reject_soft_hard=not args.allow_soft_hard,
+        borderline_threshold=args.borderline_threshold,
+        repo_exact_accept_threshold=args.repo_exact_accept_threshold,
+        qualifier_score_threshold=args.qualifier_score_threshold,
+        qualifier_owner_accept_threshold=args.qualifier_owner_accept_threshold,
+        soft_review_threshold=args.soft_review_threshold,
+        repo_borderline_min=args.repo_borderline_min,
     )
-    return cs.decision == "accept"
+    return cs.decision == "accept" or (args.insert_review and cs.decision == "review")
 
 
 def build_version_index(conn: sqlite3.Connection, args: argparse.Namespace) -> Counter:
@@ -2020,17 +2245,25 @@ def main() -> None:
         default=[],
         help="개별 sample git list 파일 경로. 여러 번 지정 가능. --git-dir와 함께 사용할 수 있다.",
     )
-    ap.add_argument("--out-workspace", default="workspace_refiltered_nvd2db")
+    ap.add_argument("--out-workspace", default="workspace_refiltered_v2")
     ap.add_argument("--out-db-name", default="version_cve_refiltered.db")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--write-csv", action="store_true")
     ap.add_argument("--write-audit", action="store_true", help="accepted/rejected candidate pair audit CSV 출력")
     ap.add_argument("--max-rejected-audit-rows", type=int, default=200000)
+    ap.add_argument("--max-review-audit-rows", type=int, default=200000)
+    ap.add_argument("--insert-review", action="store_true", help="review 후보까지 cve_github_refs/nvd_cpe_ranges에 삽입한다. 기본은 accept만 삽입.")
     ap.add_argument("--skip-version-index", action="store_true")
 
     ap.add_argument("--alpha-owner", type=float, default=0.8)
     ap.add_argument("--alpha-repo", type=float, default=0.5)
     ap.add_argument("--threshold", type=float, default=0.90)
+    ap.add_argument("--borderline-threshold", type=float, default=0.88)
+    ap.add_argument("--repo-exact-accept-threshold", type=float, default=0.98)
+    ap.add_argument("--qualifier-score-threshold", type=float, default=0.90)
+    ap.add_argument("--qualifier-owner-accept-threshold", type=float, default=0.90)
+    ap.add_argument("--soft-review-threshold", type=float, default=0.90)
+    ap.add_argument("--repo-borderline-min", type=float, default=0.84)
     ap.add_argument("--owner-weight", type=float, default=0.35)
     ap.add_argument("--ngram", type=int, default=2)
     ap.add_argument("--compact-mode", choices=["sorted", "original", "both_max"], default="sorted")
@@ -2054,6 +2287,13 @@ def main() -> None:
         raise ValueError("--alpha-repo must be between 0 and 1")
     if not (0.0 <= args.threshold <= 1.0):
         raise ValueError("--threshold must be between 0 and 1")
+    for name in [
+        "borderline_threshold", "repo_exact_accept_threshold", "qualifier_score_threshold",
+        "qualifier_owner_accept_threshold", "soft_review_threshold", "repo_borderline_min",
+    ]:
+        value = getattr(args, name)
+        if not (0.0 <= value <= 1.0):
+            raise ValueError(f"--{name.replace('_', '-')} must be between 0 and 1")
     if not (0.0 <= args.owner_weight <= 1.0):
         raise ValueError("--owner-weight must be between 0 and 1")
     if args.ngram <= 0:
@@ -2128,14 +2368,21 @@ def main() -> None:
             "alpha_owner": args.alpha_owner,
             "alpha_repo": args.alpha_repo,
             "threshold": args.threshold,
+            "borderline_threshold": args.borderline_threshold,
+            "repo_exact_accept_threshold": args.repo_exact_accept_threshold,
+            "qualifier_score_threshold": args.qualifier_score_threshold,
+            "qualifier_owner_accept_threshold": args.qualifier_owner_accept_threshold,
+            "soft_review_threshold": args.soft_review_threshold,
+            "repo_borderline_min": args.repo_borderline_min,
             "owner_weight": args.owner_weight,
             "ngram": args.ngram,
             "compact_mode": args.compact_mode,
             "git_sample_allowlist_enabled": bool(args.git_allowlist),
             "allow_soft_hard": args.allow_soft_hard,
+            "insert_review": args.insert_review,
             "recheck_range_repo_score_for_index": args.recheck_range_repo_score_for_index,
         },
-        "note": "Use --git-dir or --git-list to restrict final DB mappings to sample_*_git repos. No LLM is used in this builder; soft/hard token candidates are counted/audited rather than inserted by default.",
+        "note": "Use --git-dir or --git-list to restrict final DB mappings to sample_*_git repos. No LLM is used in this builder; soft/hard and borderline/qualifier review candidates are counted/audited rather than inserted by default; use --insert-review to include review candidates.",
     })
 
     print("[STEP 4] write summary")
